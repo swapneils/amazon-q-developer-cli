@@ -284,7 +284,7 @@ impl ChatArgs {
         info!(?conversation_id, "Generated new conversation id");
         let (prompt_request_sender, prompt_request_receiver) = std::sync::mpsc::channel::<Option<String>>();
         let (prompt_response_sender, prompt_response_receiver) = std::sync::mpsc::channel::<Vec<String>>();
-        let mut tool_manager = ToolManagerBuilder::default()
+        let (mut tool_manager, sampling_receiver) = ToolManagerBuilder::default()
             .prompt_list_sender(prompt_response_sender)
             .prompt_list_receiver(prompt_request_receiver)
             .conversation_id(&conversation_id)
@@ -292,6 +292,9 @@ impl ChatArgs {
             .build(os, Box::new(std::io::stderr()), !self.no_interactive)
             .await?;
         let tool_config = tool_manager.load_tools(os, &mut stderr).await?;
+
+        // Set the ApiClient for MCP clients that have sampling enabled
+        tool_manager.set_streaming_client(std::sync::Arc::new(os.client.clone()));
 
         ChatSession::new(
             os,
@@ -307,6 +310,7 @@ impl ChatArgs {
             model_id,
             tool_config,
             !self.no_interactive,
+            sampling_receiver,
         )
         .await?
         .spawn(os)
@@ -480,6 +484,8 @@ pub struct ChatSession {
     conversation: ConversationState,
     tool_uses: Vec<QueuedTool>,
     pending_tool_index: Option<usize>,
+    /// Channel receiver for incoming sampling requests from MCP servers
+    sampling_receiver: tokio::sync::mpsc::UnboundedReceiver<crate::mcp_client::sampling_ipc::PendingSamplingRequest>,
     /// Telemetry events to be sent as part of the conversation.
     tool_use_telemetry_events: HashMap<String, ToolUseEventBuilder>,
     /// State used to keep track of tool use relation
@@ -508,6 +514,7 @@ impl ChatSession {
         model_id: Option<String>,
         tool_config: HashMap<String, ToolSpec>,
         interactive: bool,
+        sampling_receiver: tokio::sync::mpsc::UnboundedReceiver<crate::mcp_client::sampling_ipc::PendingSamplingRequest>,
     ) -> Result<Self> {
         let valid_model_id = match model_id {
             Some(id) => id,
@@ -584,6 +591,7 @@ impl ChatSession {
             conversation,
             tool_uses: vec![],
             pending_tool_index: None,
+            sampling_receiver,
             tool_use_telemetry_events: HashMap::new(),
             tool_use_status: ToolUseStatus::Idle,
             failed_request_ids: Vec::new(),
@@ -1265,6 +1273,17 @@ impl ChatSession {
                 .collect::<Vec<_>>();
             self.input_source
                 .put_skim_command_selector(os, Arc::new(context_manager.clone()), tool_names);
+        }
+
+        // Check for incoming sampling requests and automatically approve them
+        // Since servers now opt-in via configuration, any request that comes through should be approved
+        while let Ok(mut sampling_request) = self.sampling_receiver.try_recv() {
+            tracing::info!(target: "mcp", "Auto-approving sampling request from configured server: {}", sampling_request.server_name);
+
+            // Automatically approve the sampling request
+            sampling_request.send_approval_result(
+                crate::mcp_client::sampling_ipc::SamplingApprovalResult::approved()
+            );
         }
 
         execute!(
@@ -2360,6 +2379,12 @@ mod tests {
         agents
     }
 
+    #[cfg(test)]
+    fn create_dummy_sampling_receiver() -> tokio::sync::mpsc::UnboundedReceiver<crate::mcp_client::sampling_ipc::PendingSamplingRequest> {
+        let (_sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        receiver
+    }
+
     #[tokio::test]
     async fn test_flow() {
         let mut os = Os::new().await.unwrap();
@@ -2403,6 +2428,7 @@ mod tests {
             None,
             tool_config,
             true,
+            create_dummy_sampling_receiver(),
         )
         .await
         .unwrap()
@@ -2544,6 +2570,7 @@ mod tests {
             None,
             tool_config,
             true,
+            create_dummy_sampling_receiver(),
         )
         .await
         .unwrap()
@@ -2640,6 +2667,7 @@ mod tests {
             None,
             tool_config,
             true,
+            create_dummy_sampling_receiver(),
         )
         .await
         .unwrap()
@@ -2714,6 +2742,7 @@ mod tests {
             None,
             tool_config,
             true,
+            create_dummy_sampling_receiver(),
         )
         .await
         .unwrap()
@@ -2764,6 +2793,7 @@ mod tests {
             None,
             tool_config,
             true,
+            create_dummy_sampling_receiver(),
         )
         .await
         .unwrap()
